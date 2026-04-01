@@ -5,11 +5,20 @@ from typing import Dict, List, Optional
 
 
 def _default_codedllm_root() -> str:
-    # CWEval and CodeDllm are sibling directories in this workspace layout.
+    # Support both layouts:
+    # 1) sibling: /.../codediffu/{CWEval,CodeDllm}
+    # 2) submodule: /.../CodeDllm/external/CWEval
     here = Path(__file__).resolve()
     cweval_root = here.parent.parent
-    candidate = cweval_root.parent / "CodeDllm"
-    return str(candidate)
+    candidates = [
+        cweval_root.parent / "CodeDllm",  # sibling layout
+        cweval_root.parent.parent,  # submodule layout (CodeDllm/external/CWEval)
+    ]
+    for cand in candidates:
+        if (cand / "models").exists():
+            return str(cand)
+    # Fallback to sibling convention for backward compatibility.
+    return str(candidates[0])
 
 
 class DreamAPI:
@@ -76,7 +85,7 @@ class DreamAPI:
             self._tokenizer = DreamTokenizer.from_pretrained(
                 self.model_path, trust_remote_code=True, padding_side="left"
             )
-        else:
+        elif self.backend == "dream":
             from models import DreamModel, DreamTokenizer
 
             self._model = DreamModel.from_pretrained(
@@ -87,6 +96,8 @@ class DreamAPI:
             self._tokenizer = DreamTokenizer.from_pretrained(
                 self.model_path, trust_remote_code=True, padding_side="left"
             )
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}")
 
         if self.device.startswith("cuda") and torch.cuda.is_available():
             self._model = self._model.to(self.device)
@@ -153,9 +164,18 @@ class DreamAPI:
             batch_attention_mask = attention_mask_single
             repeats = n
         else:
-            batch_input_ids = input_ids_single.repeat(n, 1)
-            batch_attention_mask = attention_mask_single.repeat(n, 1)
-            repeats = 1
+            # Memory-safe chunking for long diffusion; avoid large in-batch repeat(n, 1)
+            # that can OOM on multitask/base dream models.
+            MEMORY_SAFE_MAX_REPEAT = 4
+            steps_cap = 512
+            if steps >= steps_cap and n > MEMORY_SAFE_MAX_REPEAT:
+                chunk_repeat = MEMORY_SAFE_MAX_REPEAT
+                repeats = (n + chunk_repeat - 1) // chunk_repeat
+            else:
+                chunk_repeat = n
+                repeats = 1
+            batch_input_ids = input_ids_single.repeat(chunk_repeat, 1)
+            batch_attention_mask = attention_mask_single.repeat(chunk_repeat, 1)
 
         for _ in range(repeats):
             with torch.no_grad():

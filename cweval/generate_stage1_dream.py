@@ -17,11 +17,14 @@ import datetime
 import json
 import multiprocessing as mp
 import os
+import queue
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import fire
 from natsort import natsorted
+from tqdm import tqdm
 
 from cweval.ai_dream import DreamAPI
 from cweval.commons import BENCHMARK_DIR, LANGS
@@ -59,7 +62,7 @@ class GenerStage1Dream:
         use_rsp_prefix: bool = False,
         seed: int = None,
         gpu_ids: str = "",
-        pin_worker_to_gpu: bool = True,
+        test_limit: int = 0,
     ):
         if not model_path:
             raise ValueError("model_path is required for Dream stage-1 generation")
@@ -73,8 +76,8 @@ class GenerStage1Dream:
         self.exclude_path = self._normalize_list_arg(exclude_path)
         self.include_path = self._normalize_list_arg(include_path)
         self.num_samples = int(n)
-        self.pin_worker_to_gpu = bool(pin_worker_to_gpu)
         self.gpu_ids = self._resolve_gpu_ids(gpu_ids)
+        self.test_limit = int(test_limit)
 
         self.ai_kwargs = {
             "n": int(n),
@@ -99,6 +102,8 @@ class GenerStage1Dream:
             os.makedirs(self.eval_path, exist_ok=True)
 
         self.cases = self._get_cases()
+        if self.test_limit > 0:
+            self.cases = dict(list(self.cases.items())[: self.test_limit])
         self._write_config_snapshot()
 
     def _write_config_snapshot(self) -> None:
@@ -116,7 +121,7 @@ class GenerStage1Dream:
             "include_path": self.include_path,
             "ai_kwargs": self.ai_kwargs,
             "gpu_ids": self.gpu_ids,
-            "pin_worker_to_gpu": self.pin_worker_to_gpu,
+            "test_limit": self.test_limit,
             "num_cases": len(self.cases),
             "eval_path": self.eval_path,
         }
@@ -124,9 +129,33 @@ class GenerStage1Dream:
             json.dump(payload, f, indent=2)
 
     @staticmethod
-    def _resolve_gpu_ids(gpu_ids: str) -> List[int]:
+    def _render_prompt_text(ppt: str, lang: str, code_prompt: str) -> str:
+        prompt_cls = make_prompt(ppt)
+        if hasattr(prompt_cls, "PPT") and hasattr(prompt_cls, "LANG_INSTR"):
+            return prompt_cls.PPT.format(
+                lang=lang,
+                lang_instr=prompt_cls.LANG_INSTR[lang],
+                code_prompt=code_prompt,
+            )
+        # Fallback for unknown prompt implementations.
+        return code_prompt
+
+    @staticmethod
+    def _resolve_gpu_ids(gpu_ids) -> List[int]:
         if gpu_ids:
-            return [int(x.strip()) for x in gpu_ids.split(",") if x.strip() != ""]
+            if isinstance(gpu_ids, str):
+                return [int(x.strip()) for x in gpu_ids.split(",") if x.strip() != ""]
+            if isinstance(gpu_ids, (list, tuple)):
+                out: List[int] = []
+                for item in gpu_ids:
+                    if isinstance(item, str):
+                        out.extend(
+                            [int(x.strip()) for x in item.split(",") if x.strip() != ""]
+                        )
+                    else:
+                        out.append(int(item))
+                return out
+            return [int(gpu_ids)]
         try:
             import torch
 
@@ -194,11 +223,17 @@ class GenerStage1Dream:
                     "generated_{index}",
                     rel_task_file_path.replace("_task", "_raw"),
                 )
+                prompt_path = os.path.join(
+                    self.eval_path,
+                    "prompts",
+                    rel_task_file_path.replace("_task", "_prompt.txt"),
+                )
                 cases[task_file_path] = {
                     "task_file_path": task_file_path,
                     "code_prompt": code_prompt,
                     "lang": lang,
                     "out_path_template": out_path_template,
+                    "prompt_path": prompt_path,
                 }
         return cases
 
@@ -210,9 +245,8 @@ class GenerStage1Dream:
         ppt: str,
         case: Dict[str, str],
         ai_kwargs: Dict[str, Any],
-        worker_gpu_ids: List[int],
-        pin_worker_to_gpu: bool,
-        rank: int,
+        device: str,
+        progress_queue: Optional[Any] = None,
     ) -> None:
         requested_n = int(ai_kwargs.get("n", 1))
         missing_indices = []
@@ -222,11 +256,16 @@ class GenerStage1Dream:
                 missing_indices.append(i)
         if not missing_indices:
             print(f'{case["out_path_template"]} already completed, skipping', flush=True)
+            if progress_queue is not None:
+                progress_queue.put(1)
             return
 
-        device = "cuda"
-        if pin_worker_to_gpu and worker_gpu_ids:
-            device = f"cuda:{worker_gpu_ids[rank % len(worker_gpu_ids)]}"
+        prompt_text = GenerStage1Dream._render_prompt_text(
+            ppt, case["lang"], case["code_prompt"]
+        )
+        os.makedirs(os.path.dirname(case["prompt_path"]), exist_ok=True)
+        with open(case["prompt_path"], "w", encoding="utf-8") as f:
+            f.write(prompt_text)
 
         cache_key = f"{backend}|{model_path}|{codedllm_root}|{device}|{json.dumps(ai_kwargs, sort_keys=True, default=str)}"
         aiapi = _WORKER_API_CACHE.get(cache_key)
@@ -259,6 +298,31 @@ class GenerStage1Dream:
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(resp)
+        if progress_queue is not None:
+            progress_queue.put(1)
+
+    @staticmethod
+    def _run_shard(
+        backend: str,
+        model_path: str,
+        codedllm_root: str,
+        ppt: str,
+        shard_cases: List[Dict[str, str]],
+        ai_kwargs: Dict[str, Any],
+        device: str,
+        progress_queue: Optional[Any] = None,
+    ) -> None:
+        for case in shard_cases:
+            GenerStage1Dream._gen_case(
+                backend=backend,
+                model_path=model_path,
+                codedllm_root=codedllm_root,
+                ppt=ppt,
+                case=case,
+                ai_kwargs=ai_kwargs,
+                device=device,
+                progress_queue=progress_queue,
+            )
 
     def _build_manifest(self) -> Dict[str, Any]:
         entries = []
@@ -312,43 +376,67 @@ class GenerStage1Dream:
 
     def gen(self) -> None:
         os.makedirs(self.eval_path, exist_ok=True)
-        # Local CUDA + forked workers breaks PyTorch; use spawn for num_proc > 1.
         cases_list = list(self.cases.values())
-        if self.num_proc <= 1:
-            for rank, case in enumerate(cases_list):
+        if not cases_list:
+            self.write_manifest()
+            return
+
+        worker_count = max(1, min(self.num_proc, len(cases_list)))
+        shards: List[List[Dict[str, str]]] = [[] for _ in range(worker_count)]
+        for idx, case in enumerate(cases_list):
+            shards[idx % worker_count].append(case)
+
+        if self.gpu_ids:
+            devices = [f"cuda:{self.gpu_ids[i % len(self.gpu_ids)]}" for i in range(worker_count)]
+        else:
+            devices = ["cuda"] * worker_count
+        total_tasks = len(cases_list)
+
+        if worker_count == 1:
+            for case in tqdm(shards[0], total=len(shards[0]), desc="stage1 tasks"):
                 GenerStage1Dream._gen_case(
-                    self.backend,
-                    self.model_path,
-                    self.codedllm_root,
-                    self.ppt,
-                    case,
-                    self.ai_kwargs,
-                    self.gpu_ids,
-                    self.pin_worker_to_gpu,
-                    rank,
+                    backend=self.backend,
+                    model_path=self.model_path,
+                    codedllm_root=self.codedllm_root,
+                    ppt=self.ppt,
+                    case=case,
+                    ai_kwargs=self.ai_kwargs,
+                    device=devices[0],
                 )
         else:
             ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(
-                max_workers=self.num_proc, mp_context=ctx
-            ) as pool:
-                futures = [
-                    pool.submit(
-                        GenerStage1Dream._gen_case,
+            manager = ctx.Manager()
+            progress_queue = manager.Queue()
+            with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as pool:
+                future_sizes = {}
+                for i in range(worker_count):
+                    fut = pool.submit(
+                        GenerStage1Dream._run_shard,
                         self.backend,
                         self.model_path,
                         self.codedllm_root,
                         self.ppt,
-                        case,
+                        shards[i],
                         self.ai_kwargs,
-                        self.gpu_ids,
-                        self.pin_worker_to_gpu,
-                        rank,
+                        devices[i],
+                        progress_queue,
                     )
-                    for rank, case in enumerate(cases_list)
-                ]
-                for fut in as_completed(futures):
-                    fut.result()
+                    future_sizes[fut] = len(shards[i])
+                pbar = tqdm(total=total_tasks, desc="stage1 tasks")
+                done = 0
+                while done < total_tasks:
+                    try:
+                        step = progress_queue.get(timeout=0.2)
+                        done += int(step)
+                        pbar.update(int(step))
+                    except queue.Empty:
+                        pass
+                    # Surface worker exception as soon as possible.
+                    for fut in future_sizes:
+                        if fut.done():
+                            fut.result()
+                pbar.close()
+                manager.shutdown()
         self.write_manifest()
 
 

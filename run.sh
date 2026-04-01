@@ -1,0 +1,34 @@
+python cweval/generate_stage1_dream.py gen \
+  --backend dream_multitask \
+  --model_path ../../projects/sft_dream_py_ast/multitask_stage2_sven_bigvul_all_1_1024_5e-6lr_1000traincases_2epochs_0.02/checkpoint-1000 \
+  --codedllm_root /research/jiamin0630/codediffu/CodeDllm \
+  --eval_path evals/eval_ckpt1000_sven_bigvul_n8_4gpu \
+  --ppt direct \
+  --num_proc 4 \
+  --gpu_ids 0,1,2,3 \
+  --langs py,c,cpp \
+  --n 4 \
+  --max_completion_tokens 1024 \
+  --steps 512 \
+  --temperature 0.1 \
+  --top_p 0.9 \
+  --alg entropy \
+  --alg_temp 0.1 \
+  --test_limit 100
+
+python cweval/generate_stage1_dream.py gen \
+  --backend dream \
+  --model_path ../../../dLLM-RL/local_models/dream-7b-instruct \
+  --eval_path evals/eval_dream-7b-instruct_n8_4gpu \
+  --ppt direct \
+  --num_proc 4 \
+  --gpu_ids 0,1,2,3 \
+   --langs py,c,cpp \
+  --n 4 \
+  --max_completion_tokens 1024 \
+  --steps 512 \
+  --temperature 0.1 \
+  --top_p 0.9 \
+  --alg entropy \
+  --alg_temp 0.1 \
+  --test_limit 100

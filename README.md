@@ -1,3 +1,13 @@
+# Env
+
+```bash
+conda create -n cweval-dlm python=3.10
+conda activate cweval-dlm
+pip install -r requirements/core.txt
+pip install -r requirements/ai.txt
+pip install -r requirements/requirements.txt
+```
+
 # 🛡 CWEval
 
 Is the LLM-generated code 🔧 functional ***and*** ⛑️ secure? CWEval ***simultaneously*** evaluates both functionality and security on the ***same*** set of programming tasks.
