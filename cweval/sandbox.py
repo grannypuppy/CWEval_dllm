@@ -8,7 +8,13 @@ import docker.models.containers
 
 
 class Container:
-    def __init__(self, image: str, name: str | None = None, user: str = 'root') -> None:
+    def __init__(
+        self,
+        image: str,
+        name: str | None = None,
+        user: str = 'root',
+        volumes: dict | None = None,
+    ) -> None:
         self.client = docker.from_env()
         self.image_name = image
         self.image = self.client.images.get(image)
@@ -17,6 +23,7 @@ class Container:
             name=name,
             detach=True,
             tty=True,
+            volumes=volumes or {},
         )
         self.user = user
 
@@ -24,10 +31,12 @@ class Container:
         self.container.kill()
         self.container.remove(force=True)
 
-    def exec_cmd(self, cmd: str, workdir: str | None = None) -> Tuple[int, str, str]:
+    def exec_cmd(
+        self, cmd: str, workdir: str | None = None, user: str | None = None
+    ) -> Tuple[int, str, str]:
         exit_code, (stdout, stderr) = self.container.exec_run(
             cmd,
-            user=self.user,
+            user=user if user is not None else self.user,
             workdir=workdir,
             stdout=True,
             stderr=True,

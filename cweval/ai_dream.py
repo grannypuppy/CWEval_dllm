@@ -85,6 +85,27 @@ class DreamAPI:
             self._tokenizer = DreamTokenizer.from_pretrained(
                 self.model_path, trust_remote_code=True, padding_side="left"
             )
+        elif self.backend == "dream_multitask_ast":
+            # Multitask Dream + ast_ex rank-weighted path, with CWEval-aligned
+            # ``extract_code_from_output`` (``generation_utils_ast_ex_cweval``).
+            from models.dream_multitask import DreamModel
+            from models.dream_multitask.tokenization_dream import DreamTokenizer
+            from models.dream_multitask.generation_utils_ast_ex_cweval import (
+                DreamGenerationMixin as AstExCwevalMixin,
+            )
+
+            self._model = DreamModel.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.bfloat16 if self.torch_dtype == "bf16" else None,
+                trust_remote_code=True,
+            ).eval()
+            self._model.diffusion_generate = types.MethodType(
+                AstExCwevalMixin.diffusion_generate, self._model
+            )
+            self._model._sample = types.MethodType(AstExCwevalMixin._sample, self._model)
+            self._tokenizer = DreamTokenizer.from_pretrained(
+                self.model_path, trust_remote_code=True, padding_side="left"
+            )
         elif self.backend == "dream":
             from models import DreamModel, DreamTokenizer
 
@@ -93,6 +114,67 @@ class DreamAPI:
                 torch_dtype=torch.bfloat16 if self.torch_dtype == "bf16" else None,
                 trust_remote_code=True,
             ).eval()
+            self._tokenizer = DreamTokenizer.from_pretrained(
+                self.model_path, trust_remote_code=True, padding_side="left"
+            )
+        elif self.backend == "dream_ast":
+            # Same base model as "dream", but monkey-patches the AST-guided
+            # diffusion_generate / _sample from generation_utils_ast.py so that
+            # every denoising step re-weights token confidence by AST node depth.
+            from models import DreamModel, DreamTokenizer
+            from models.dream.generation_utils_ast_cweval import (
+                DreamGenerationMixin as AstMixin,
+            )
+
+            self._model = DreamModel.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.bfloat16 if self.torch_dtype == "bf16" else None,
+                trust_remote_code=True,
+            ).eval()
+            self._model.diffusion_generate = types.MethodType(
+                AstMixin.diffusion_generate, self._model
+            )
+            self._model._sample = types.MethodType(AstMixin._sample, self._model)
+            self._tokenizer = DreamTokenizer.from_pretrained(
+                self.model_path, trust_remote_code=True, padding_side="left"
+            )
+        elif self.backend == "dream_bandit":
+            # Same base Dream model, but monkey-patches Bandit-guided
+            # diffusion path with CWEval-compatible extract_code_from_output.
+            from models import DreamModel, DreamTokenizer
+            from models.dream.generation_utils_bandit_cweval import (
+                DreamGenerationMixin as BanditMixin,
+            )
+
+            self._model = DreamModel.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.bfloat16 if self.torch_dtype == "bf16" else None,
+                trust_remote_code=True,
+            ).eval()
+            self._model.diffusion_generate = types.MethodType(
+                BanditMixin.diffusion_generate, self._model
+            )
+            self._model._sample = types.MethodType(BanditMixin._sample, self._model)
+            self._tokenizer = DreamTokenizer.from_pretrained(
+                self.model_path, trust_remote_code=True, padding_side="left"
+            )
+        elif self.backend == "dream_codeql":
+            # Same base Dream model, but monkey-patches CodeQL-guided
+            # diffusion path with CWEval-compatible fenced code extraction.
+            from models import DreamModel, DreamTokenizer
+            from models.dream.generation_utils_codeql_cweval import (
+                DreamGenerationMixin as CodeQLMixin,
+            )
+
+            self._model = DreamModel.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.bfloat16 if self.torch_dtype == "bf16" else None,
+                trust_remote_code=True,
+            ).eval()
+            self._model.diffusion_generate = types.MethodType(
+                CodeQLMixin.diffusion_generate, self._model
+            )
+            self._model._sample = types.MethodType(CodeQLMixin._sample, self._model)
             self._tokenizer = DreamTokenizer.from_pretrained(
                 self.model_path, trust_remote_code=True, padding_side="left"
             )
@@ -120,6 +202,13 @@ class DreamAPI:
         alg = str(all_kwargs.pop("alg", "entropy"))
         alg_temp = float(all_kwargs.pop("alg_temp", 0.1))
         threshold = all_kwargs.pop("threshold", None)
+        shrink = int(all_kwargs.pop("shrink", 8))
+        codeql_penalty_ratio = float(all_kwargs.pop("codeql_penalty_ratio", 0.5))
+        codeql_timeout_sec = float(all_kwargs.pop("codeql_timeout_sec", 10.0))
+        codeql_bin = all_kwargs.pop("codeql_bin", None)
+        codeql_query_path = all_kwargs.pop("codeql_query_path", None)
+        # lang is forwarded by ppt.req_ai; dream_ast/dream_bandit use it in generation utils.
+        lang = str(all_kwargs.pop("lang", "python"))
         # Ignored for backward compatibility (block/cached generation path deprecated).
         for _k in ("use_cache", "dual_cache", "block_length"):
             all_kwargs.pop(_k, None)
@@ -155,6 +244,17 @@ class DreamAPI:
             "threshold": threshold,
             "tokenizer": self._tokenizer,
         }
+        if self.backend == "dream_codeql":
+            gen_kwargs["shrink"] = shrink
+            gen_kwargs["codeql_penalty_ratio"] = codeql_penalty_ratio
+            gen_kwargs["codeql_timeout_sec"] = codeql_timeout_sec
+            if codeql_bin:
+                gen_kwargs["codeql_bin"] = codeql_bin
+            if codeql_query_path:
+                gen_kwargs["codeql_query_path"] = codeql_query_path
+        # Forward ``lang`` when backend generation utils accept language-aware extraction/parsing.
+        if self.backend in ("dream_ast", "dream_multitask_ast", "dream_bandit", "dream_codeql"):
+            gen_kwargs["lang"] = lang
 
         outputs: List[str] = []
         # Align behavior with CodeDllm benchmark scripts:

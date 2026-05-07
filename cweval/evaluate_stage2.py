@@ -7,7 +7,7 @@ parse -> compile -> tests -> merge -> report.
 
 import json
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 import fire
 from natsort import natsorted
@@ -113,16 +113,40 @@ class EvalerStage2(Evaler):
     def stage2_merge(self) -> None:
         self._merge_results()
 
-    def stage2_report(self) -> None:
-        self.report_pass_at_k(mode="auto")
+    def stage2_report(self, k: Optional[int] = None) -> None:
+        """
+        Pass@k summary. If k is omitted, sweeps default ks (1/4/10/50); if set, only that k.
 
-    def stage2_pipeline(self, docker: bool = True) -> None:
+        Example: only pass@4 -- ``stage2_report --k 4`` (with eval_path on the class / CLI).
+        """
+        self.report_pass_at_k(k=k, mode="auto")
+
+    def stage2_report_py_js(self, k: Optional[int] = None) -> None:
+        """
+        Pass@k for **py + js** only (``core/py/``, ``core/js/``, and combined ``all(py+js)``),
+        for k in ``1..5`` when ``k`` is omitted, or only that ``k`` when set.
+
+        Writes ``report_pass_at_{k}_py_js.txt`` next to ``res_all.json``. Requires an
+        up-to-date ``res_all.json`` (run ``stage2_merge`` or full ``stage2_pipeline`` first).
+        """
+        self.report_pass_at_k(k=k, mode="py_js_auto")
+
+    def stage2_pipeline(self, docker: bool = True, k: Optional[int] = None) -> None:
+        """
+        Full stage-2. Optional ``k`` is forwarded to report (same semantics as
+        ``evaluate.Evaler.report_pass_at_k``).
+
+        Fire CLI order: global args first, then subcommand, then subcommand args::
+
+            python cweval/evaluate_stage2.py --eval_path evals/foo --num_proc 8 \\
+                stage2_pipeline --docker True --k 4
+        """
         self.validate_generation_complete(strict=True)
         self.parse_generated()
         self.compile_parsed()
         self.stage2_test(docker=docker)
         self._merge_results()
-        self.report_pass_at_k(mode="auto")
+        self.report_pass_at_k(k=k, mode="auto")
 
 
 if __name__ == "__main__":

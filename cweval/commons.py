@@ -2,7 +2,38 @@ import multiprocessing as mp
 import os
 import subprocess
 import tempfile
-from typing import Any, Callable, List, Tuple
+from typing import Any, Callable, Iterable, List, Tuple
+
+# Written next to res_all.json by evaluate.Evaler.report_pass_at_k.
+# When k is known (single-k mode) the filename uses the concrete value,
+# e.g. report_pass_at_1.txt / report_pass_at_4.txt.
+# When sweeping multiple ks the fallback name is used.
+PASS_AT_K_REPORT_FILENAME = 'report_pass_at_k.txt'
+
+
+def pass_at_k_report_filename(k: 'int | None') -> str:
+    """Return the report filename for a given k (or the sweep fallback)."""
+    if k is not None:
+        return f'report_pass_at_{k}.txt'
+    return PASS_AT_K_REPORT_FILENAME
+
+
+def reset_pass_at_k_report_file(eval_path: str, k: 'int | None' = None) -> str:
+    """Truncate the pass@k summary file under eval_path (same dir as res_all.json)."""
+    path = os.path.join(eval_path, pass_at_k_report_filename(k))
+    with open(path, 'w', encoding='utf-8'):
+        pass
+    return path
+
+
+def append_pass_at_k_report_lines(
+    eval_path: str, lines: Iterable[str], k: 'int | None' = None
+) -> None:
+    """Append lines (same text as printed to stdout) to the report file."""
+    path = os.path.join(eval_path, pass_at_k_report_filename(k))
+    with open(path, 'a', encoding='utf-8') as f:
+        for line in lines:
+            f.write(line + '\n')
 
 import fire
 import numpy as np
@@ -184,6 +215,31 @@ def get_code_from(
     only_first: bool = False,
     add_new_line: bool = False,
 ) -> str:
+    """
+    Extract fenced code blocks from model output.
+
+    Handles two failure modes common in diffusion language model outputs:
+
+    1. Nested language fences inside docstrings (e.g. ```sql inside a C block):
+       - The original logic treated any line starting with ``` as a closing fence,
+         so ```sql in a comment would prematurely end extraction.
+       - Fix: only treat a line as a closing fence when it starts with 3+ backticks
+         followed ONLY by optional whitespace (no language specifier). Lines like
+         ```sql, ```c, ```@param are treated as nested content, not closers.
+
+    2. Closing ``` embedded mid-line (e.g. degenerate ``````the the the...):
+       - The original logic never recognised these because it checked line.startswith.
+       - Fix: after failing the line-start check, scan for the first ``` occurrence
+         inside the line (idx > 0) and truncate the code there.
+
+    3. Degenerate line-start fences like ``````words (DLLM often emits 4+ backticks
+       then text on the same line). These must close the block; only ```lang (3 ticks
+       + language) should stay as nested content.
+       - Fix: if the leading backtick run length is >= 4 and there is non-whitespace
+         after the run, treat as closing fence.
+    """
+    import re
+
     assert not (
         only_last and only_first
     ), '`only_last` and `only_first` cannot be both True'
@@ -191,6 +247,20 @@ def get_code_from(
     code_blocks: List[str] = []
     msg_lines = msg.splitlines()
     i_line = 0
+
+    # A proper closing fence: 3+ backticks followed only by optional whitespace.
+    # Any other line starting with ``` (e.g. ```sql, ```@param) is treated as content.
+    _CLOSE_FENCE = re.compile(r'^`{3,}\s*$')
+
+    def _leading_backtick_run(s: str) -> int:
+        n = 0
+        for ch in s:
+            if ch == '`':
+                n += 1
+            else:
+                break
+        return n
+
     while i_line < len(msg_lines):
         line = msg_lines[i_line]
         if line.startswith('```'):
@@ -199,8 +269,28 @@ def get_code_from(
             while i_line < len(msg_lines):
                 line = msg_lines[i_line]
                 if line.startswith('```'):
-                    break
-                code_lines.append(line)
+                    if _CLOSE_FENCE.match(line):
+                        # Plain ``` (only backticks + optional whitespace) — proper closing
+                        break
+                    run_len = _leading_backtick_run(line)
+                    rest_after_run = line[run_len:]
+                    if run_len >= 4 and rest_after_run.strip():
+                        # e.g. ``````the the the — DLLM closing garbage on same line
+                        break
+                    # ```sql, ```@param, ```: etc. — nested or malformed fence.
+                    # 3 ticks + language: keep as content; 4+ ticks with no trailing
+                    # text falls through here (rare); plain-only long runs hit _CLOSE_FENCE.
+                    code_lines.append(line)
+                else:
+                    # Check for ``` embedded in the middle of the line
+                    # (degenerate diffusion output like ``````the the the...)
+                    idx = line.find('```')
+                    if idx > 0:
+                        # Truncate code at the embedded backticks
+                        code_lines.append(line[:idx].rstrip())
+                        i_line += 1
+                        break
+                    code_lines.append(line)
                 i_line += 1
             # end while for this code block
             code_blocks.append('\n'.join(code_lines) + tail)
@@ -210,7 +300,7 @@ def get_code_from(
         i_line += 1
     # end while for all code blocks
     if only_last:
-        return code_blocks[-1]
+        return code_blocks[-1] if code_blocks else ''
     return '\n'.join(code_blocks)
 
 
@@ -266,10 +356,16 @@ def run_in_subprocess(func: Callable[..., Any], *args, **kwargs) -> Any:
 
 def pass_at_k(n, c, k) -> float:
     """
-    :param n: total number of samples
-    :param c: number of correct samples
-    :param k: k in pass@$k$
+    Unbiased pass@k estimate (single problem): n draws, c correct, evaluate pass@k.
+
+    If ``n < k``, pass@k is not defined from the data (need at least k samples); returns
+    NaN so callers can exclude this problem from pass@k averages.
+
+    If ``n >= k`` and there are fewer than k incorrect samples (``n - c < k``), any
+    k-subset must include at least one correct → estimate 1.0.
     """
+    if n < k:
+        return float('nan')
     if n - c < k:
         return 1.0
     return 1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1))

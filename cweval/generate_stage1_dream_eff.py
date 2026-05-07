@@ -1,8 +1,11 @@
 """
-Stage-1 generation only for Dream / Dream-multitask on CWEval.
+Stage-1 generation only for Dream / Dream-multitask on CWEval (efficiency runs).
 
-This script intentionally only generates *_raw.* files and writes a manifest.
-It does NOT run parse/compile/tests.
+Same backends and manifest behavior as ``generate_stage1_dream.py``, plus:
+
+- ``--task_subset_file``: only benchmark tasks whose path contains a line from the file
+- ``--eff_tag``: tag written into ``eff_metrics/*.json`` records
+- Per-task wall time logged under ``<eval_path>/eff_metrics/`` (one JSON per task)
 """
 
 import sys
@@ -33,7 +36,7 @@ from cweval.ppt import make_prompt
 _WORKER_API_CACHE: Dict[str, DreamAPI] = {}
 
 
-class GenerStage1Dream:
+class GenerStage1DreamEff:
     begin_prompt_anchor = "BEGIN PROMPT"
     begin_solution_anchor = "BEGIN SOLUTION"
 
@@ -83,6 +86,8 @@ class GenerStage1Dream:
         seed: int = None,
         gpu_ids: str = "",
         test_limit: int = 0,
+        task_subset_file: str = "",
+        eff_tag: str = "",
     ):
         if not model_path:
             raise ValueError("model_path is required for Dream stage-1 generation")
@@ -103,6 +108,8 @@ class GenerStage1Dream:
         self.num_samples = int(n)
         self.gpu_ids = self._resolve_gpu_ids(gpu_ids)
         self.test_limit = int(test_limit)
+        self.task_subset_file = (task_subset_file or "").strip()
+        self.eff_tag = (eff_tag or "").strip()
 
         self.ai_kwargs = {
             "n": int(n),
@@ -133,6 +140,10 @@ class GenerStage1Dream:
         self.cases = self._get_cases()
         if self.test_limit > 0:
             self.cases = dict(list(self.cases.items())[: self.test_limit])
+        if self.task_subset_file:
+            self.cases = self._filter_cases_by_subset(self.cases, self.task_subset_file)
+        self.ai_kwargs["__eff_eval_path__"] = os.path.abspath(self.eval_path)
+        self.ai_kwargs["__eff_tag__"] = self.eff_tag
         self._write_config_snapshot()
 
     def _write_config_snapshot(self) -> None:
@@ -153,6 +164,8 @@ class GenerStage1Dream:
             "test_limit": self.test_limit,
             "num_cases": len(self.cases),
             "eval_path": self.eval_path,
+            "task_subset_file": self.task_subset_file,
+            "eff_tag": self.eff_tag,
         }
         with open(snapshot_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -177,20 +190,24 @@ class GenerStage1Dream:
 
     @staticmethod
     def _resolve_gpu_ids(gpu_ids) -> List[int]:
-        if gpu_ids:
-            if isinstance(gpu_ids, str):
-                return [int(x.strip()) for x in gpu_ids.split(",") if x.strip() != ""]
-            if isinstance(gpu_ids, (list, tuple)):
-                out: List[int] = []
-                for item in gpu_ids:
-                    if isinstance(item, str):
-                        out.extend(
-                            [int(x.strip()) for x in item.split(",") if x.strip() != ""]
-                        )
-                    else:
-                        out.append(int(item))
-                return out
-            return [int(gpu_ids)]
+        # Fire may pass ``0`` as int; ``if gpu_ids:`` would treat 0 as falsy and
+        # wrongly fall back to all GPUs. Treat explicit int (including 0) as one id.
+        if gpu_ids is None:
+            gpu_ids = ""
+        if isinstance(gpu_ids, int):
+            return [gpu_ids]
+        if isinstance(gpu_ids, str) and gpu_ids.strip():
+            return [int(x.strip()) for x in gpu_ids.split(",") if x.strip() != ""]
+        if isinstance(gpu_ids, (list, tuple)) and len(gpu_ids) > 0:
+            out: List[int] = []
+            for item in gpu_ids:
+                if isinstance(item, str):
+                    out.extend(
+                        [int(x.strip()) for x in item.split(",") if x.strip() != ""]
+                    )
+                else:
+                    out.append(int(item))
+            return out
         try:
             import torch
 
@@ -199,6 +216,60 @@ class GenerStage1Dream:
         except Exception:
             pass
         return []
+
+    @staticmethod
+    def _filter_cases_by_subset(
+        cases: Dict[str, Dict[str, str]], subset_path: str
+    ) -> Dict[str, Dict[str, str]]:
+        path = Path(subset_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"task_subset_file not found: {subset_path}")
+        needles = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    needles.append(s)
+        if not needles:
+            return cases
+        out: Dict[str, Dict[str, str]] = {}
+        for k, v in cases.items():
+            if any(n in k for n in needles):
+                out[k] = v
+        return out
+
+    @staticmethod
+    def _append_eff_metric(
+        eval_path: str,
+        eff_tag: str,
+        backend: str,
+        task_file_path: str,
+        wall_time_s: float,
+        ai_kwargs: Dict[str, Any],
+        num_responses: int,
+    ) -> None:
+        if not eval_path:
+            return
+        metrics_dir = os.path.join(eval_path, "eff_metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
+        safe = (
+            task_file_path.replace(os.sep, "_")
+            .replace("/", "_")
+            .replace("..", "_")
+        )[-200:]
+        fname = f"{safe}.json"
+        rec = {
+            "eff_tag": eff_tag,
+            "backend": backend,
+            "task_file_path": task_file_path,
+            "wall_time_ms": round(wall_time_s * 1000.0, 3),
+            "steps": ai_kwargs.get("steps"),
+            "n_requested": ai_kwargs.get("n"),
+            "num_responses": num_responses,
+            "max_completion_tokens": ai_kwargs.get("max_completion_tokens"),
+        }
+        with open(os.path.join(metrics_dir, fname), "w", encoding="utf-8") as f:
+            json.dump(rec, f, indent=2)
 
     @staticmethod
     def _normalize_list_arg(value) -> List[str]:
@@ -314,7 +385,7 @@ class GenerStage1Dream:
                 progress_queue.put(1)
             return
 
-        prompt_text = GenerStage1Dream._render_prompt_text(
+        prompt_text = GenerStage1DreamEff._render_prompt_text(
             ppt, case["lang"], case["code_prompt"],
             unsafe_code=case.get("unsafe_code", ""),
         )
@@ -322,26 +393,55 @@ class GenerStage1Dream:
         with open(case["prompt_path"], "w", encoding="utf-8") as f:
             f.write(prompt_text)
 
-        cache_key = f"{backend}|{model_path}|{codedllm_root}|{device}|{json.dumps(ai_kwargs, sort_keys=True, default=str)}"
+        eff_eval_path = str(ai_kwargs.get("__eff_eval_path__") or "")
+        eff_tag = str(ai_kwargs.get("__eff_tag__") or "")
+
+        init_kwargs = {k: v for k, v in ai_kwargs.items() if not k.startswith("__eff_")}
+        cache_key = f"{backend}|{model_path}|{codedllm_root}|{device}|{json.dumps(init_kwargs, sort_keys=True, default=str)}"
         aiapi = _WORKER_API_CACHE.get(cache_key)
         if aiapi is None:
-            init_kwargs = dict(ai_kwargs)
-            init_kwargs.pop("n", None)
+            kw = dict(init_kwargs)
+            kw.pop("n", None)
             aiapi = DreamAPI(
                 model_path=model_path,
                 backend=backend,
                 codedllm_root=codedllm_root or None,
                 device=device,
-                **init_kwargs,
+                **kw,
             )
             _WORKER_API_CACHE[cache_key] = aiapi
         prompt = make_prompt(ppt)
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        t0 = time.perf_counter()
         resps = prompt.req_ai(
             aiapi,
             case["lang"],
             case["code_prompt"],
             metadata={k: v for k, v in case.items() if k not in ["code_prompt", "lang"]},
             n=len(missing_indices),
+        )
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        t1 = time.perf_counter()
+        GenerStage1DreamEff._append_eff_metric(
+            eff_eval_path,
+            eff_tag,
+            backend,
+            case["task_file_path"],
+            t1 - t0,
+            init_kwargs,
+            len(resps),
         )
         if len(resps) != len(missing_indices):
             raise ValueError(
@@ -368,7 +468,7 @@ class GenerStage1Dream:
         progress_queue: Optional[Any] = None,
     ) -> None:
         for case in shard_cases:
-            GenerStage1Dream._gen_case(
+            GenerStage1DreamEff._gen_case(
                 backend=backend,
                 model_path=model_path,
                 codedllm_root=codedllm_root,
@@ -449,7 +549,7 @@ class GenerStage1Dream:
 
         if worker_count == 1:
             for case in tqdm(shards[0], total=len(shards[0]), desc="stage1 tasks"):
-                GenerStage1Dream._gen_case(
+                GenerStage1DreamEff._gen_case(
                     backend=self.backend,
                     model_path=self.model_path,
                     codedllm_root=self.codedllm_root,
@@ -466,7 +566,7 @@ class GenerStage1Dream:
                 future_sizes = {}
                 for i in range(worker_count):
                     fut = pool.submit(
-                        GenerStage1Dream._run_shard,
+                        GenerStage1DreamEff._run_shard,
                         self.backend,
                         self.model_path,
                         self.codedllm_root,
@@ -496,5 +596,5 @@ class GenerStage1Dream:
 
 
 if __name__ == "__main__":
-    fire.Fire(GenerStage1Dream)
+    fire.Fire(GenerStage1DreamEff)
 

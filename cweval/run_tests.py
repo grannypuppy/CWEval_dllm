@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 import pytest
+from natsort import natsorted
 
 CWD = os.getcwd()
 
@@ -24,6 +25,63 @@ class TestFileResult:
 
     def brief_str(self):
         return f'{__class__.__name__}(file=\'{self.file}\', functional={self.functional}, secure={self.secure})'
+
+
+def _pytest_roots_for_generated(
+    generated_path: str, eval_langs: List[str] | None
+) -> List[str]:
+    """If ``eval_langs`` is set (e.g. ``['py','js']``), only test under ``core/<lang>/``."""
+    if not eval_langs:
+        return [generated_path]
+    roots = []
+    for lg in eval_langs:
+        sub = os.path.join(generated_path, "core", lg)
+        if os.path.isdir(sub):
+            roots.append(sub)
+    return roots if roots else [generated_path]
+
+
+def fill_missing_collection_failures(
+    generated_path: str,
+    file_results: List[TestFileResult],
+    eval_langs: List[str] | None = None,
+) -> List[TestFileResult]:
+    """
+    Pytest skips files that fail collection (e.g. ``SyntaxError`` when importing
+    ``*_task`` from ``*_test.py``). Those files never enter ``TestResultCollector``,
+    so they would be missing from ``res.json`` and break pass@k merge counts.
+
+    Scan ``generated_path`` for every ``*_test.py``; any path not already present in
+    ``file_results`` is treated as a failed run: ``functional=False``, ``secure=False``.
+    """
+    cwd = os.getcwd()
+    seen_abs = {
+        os.path.normpath(os.path.join(cwd, fr.file)) for fr in file_results
+    }
+    out = list(file_results)
+    walk_roots = _pytest_roots_for_generated(generated_path, eval_langs)
+    for walk_root in walk_roots:
+        for root, _, files in os.walk(walk_root):
+            if '__pycache__' in root:
+                continue
+            for name in natsorted(files):
+                if not name.endswith('_test.py'):
+                    continue
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, cwd)
+                abs_path = os.path.normpath(os.path.join(cwd, rel))
+                if abs_path in seen_abs:
+                    continue
+                out.append(
+                    TestFileResult(
+                        file=rel,
+                        functional=False,
+                        secure=False,
+                        test_cases=[],
+                    )
+                )
+                seen_abs.add(abs_path)
+    return out
 
 
 class TestResultCollector:
@@ -73,7 +131,8 @@ class TestResultCollector:
         if report.when == 'call':
             nodeid = report.nodeid
             test_case = self.nodeid_to_test_case.get(nodeid)
-            # if test_case:
+            if test_case is None:
+                return
             test_case.run = True
             test_case.passed = report.outcome == 'passed'
             # print(test_case, flush=True)
@@ -90,14 +149,16 @@ def run_tests(
     test_path,
     timeout_per_test: float = 3,
     args: List[str] = ['-k', 'not _unsafe'],
+    eval_langs: List[str] | None = None,
 ) -> List[TestFileResult]:
-    print(f'Start running tests in {test_path = }', flush=True)
+    roots = _pytest_roots_for_generated(test_path, eval_langs)
+    print(f'Start running tests in {test_path = } roots={roots}', flush=True)
     result_collector = TestResultCollector(timeout_per_test=timeout_per_test)
     # temp fix:
     _os_exit = os._exit
     os._exit = lambda *args: None
     pytest.main(
-        [test_path, '--tb=short', '--continue-on-collection-errors', *args],
+        [*roots, '--tb=short', '--continue-on-collection-errors', *args],
         plugins=[result_collector],
     )
     os._exit = _os_exit
@@ -119,7 +180,12 @@ def run_tests(
         )
         # print(file_result.brief_str(), flush=True)
 
-    return list(result_collector.file_results.values())
+    results = list(result_collector.file_results.values())
+    if os.path.isdir(test_path):
+        results = fill_missing_collection_failures(
+            test_path, results, eval_langs=eval_langs
+        )
+    return results
 
 
 if __name__ == "__main__":

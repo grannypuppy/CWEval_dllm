@@ -32,10 +32,110 @@ import fire
 from natsort import natsorted
 from p_tqdm import p_map
 from tqdm import tqdm
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cweval.ai import AIAPI
 from cweval.commons import BENCHMARK_DIR, LANGS
 from cweval.ppt import make_prompt
+
+
+_HF_MODEL_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+class LocalHFAIAPI:
+    def __init__(
+        self,
+        model_path: str,
+        dtype: str = 'auto',
+        device_map: str = 'auto',
+        **kwargs,
+    ) -> None:
+        self.model_path = model_path
+        self.dtype = dtype
+        # 空串会导致 transformers 报错「found .」/ invalid device_map；与默认 `auto` 一致
+        if not (device_map and str(device_map).strip()):
+            device_map = 'auto'
+        self.device_map = device_map
+        self.req_kwargs = kwargs
+        self.tokenizer, self.model = self._load_once()
+
+    def _resolve_dtype(self):
+        if self.dtype in ('auto', None):
+            return 'auto'
+        mapping = {
+            'float16': torch.float16,
+            'fp16': torch.float16,
+            'bfloat16': torch.bfloat16,
+            'bf16': torch.bfloat16,
+            'float32': torch.float32,
+            'fp32': torch.float32,
+        }
+        if self.dtype not in mapping:
+            raise ValueError(f'Unsupported dtype: {self.dtype}')
+        return mapping[self.dtype]
+
+    def _load_once(self):
+        cache_key = f'{self.model_path}|{self.dtype}|{self.device_map}'
+        if cache_key in _HF_MODEL_CACHE:
+            return _HF_MODEL_CACHE[cache_key]['tokenizer'], _HF_MODEL_CACHE[cache_key]['model']
+
+        torch_dtype = self._resolve_dtype()
+        tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map=self.device_map,
+        )
+        model.eval()
+        _HF_MODEL_CACHE[cache_key] = {'tokenizer': tokenizer, 'model': model}
+        return tokenizer, model
+
+    def _build_input_text(self, messages: List[Dict[str, str]]) -> str:
+        chat_template = getattr(self.tokenizer, 'chat_template', None)
+        if hasattr(self.tokenizer, 'apply_chat_template') and chat_template:
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        return '\n\n'.join(m.get('content', '') for m in messages if m.get('content'))
+
+    def send_message(self, messages: List[Dict[str, str]], **kwargs) -> List[str]:
+        all_kwargs = self.req_kwargs.copy()
+        all_kwargs.update(kwargs)
+
+        n_samples = int(all_kwargs.pop('n', 1))
+        max_new_tokens = int(all_kwargs.pop('max_completion_tokens', 512))
+        temperature = float(all_kwargs.pop('temperature', 0.0))
+        top_p = all_kwargs.pop('top_p', None)
+        use_cache = bool(all_kwargs.pop('use_cache', True))
+        _ = all_kwargs.pop('lang', None)
+
+        prompt_text = self._build_input_text(messages)
+        encoded = self.tokenizer(prompt_text, return_tensors='pt')
+        encoded = {k: v.to(self.model.device) for k, v in encoded.items()}
+        input_len = encoded['input_ids'].shape[-1]
+
+        do_sample = temperature > 0
+        gen_common = {
+            'max_new_tokens': max_new_tokens,
+            'do_sample': do_sample,
+            'pad_token_id': self.tokenizer.eos_token_id,
+            'use_cache': use_cache,
+        }
+        if do_sample:
+            gen_common['temperature'] = temperature
+            if top_p is not None:
+                gen_common['top_p'] = float(top_p)
+
+        outputs: List[str] = []
+        for _ in range(n_samples):
+            with torch.no_grad():
+                out_ids = self.model.generate(**encoded, **gen_common)
+            new_ids = out_ids[0][input_len:]
+            text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+            outputs.append(text)
+        return outputs
 
 
 class Gener:
@@ -46,7 +146,9 @@ class Gener:
     def __init__(
         self,
         eval_path: str = '',
+        backend: str = 'litellm',
         model: str = 'gpt-4o-mini-2024-07-18',
+        model_path: str = '',
         ppt: str = 'direct',
         num_proc: int = 8,
         langs: List[str] = LANGS,
@@ -56,9 +158,13 @@ class Gener:
         n: int = 20,
         max_completion_tokens: int = 2048,
         temperature: float = 0.8,
+        dtype: str = 'auto',
+        device_map: str = 'auto',
         **kwargs,
     ):
+        self.backend = backend
         self.model = model
+        self.model_path = model_path
         self.ppt = ppt
         self.num_proc = num_proc
         self.langs = langs
@@ -71,6 +177,15 @@ class Gener:
             'temperature': temperature,
             **kwargs,
         }
+        if self.backend not in ('litellm', 'local_hf'):
+            raise ValueError(f'Unsupported backend: {self.backend}')
+        if self.backend == 'local_hf':
+            if not self.model_path:
+                raise ValueError('--model_path is required when --backend local_hf')
+            # local_hf does not need model name for litellm
+            self.model = self.model_path
+            self.ai_kwargs['dtype'] = dtype
+            self.ai_kwargs['device_map'] = device_map
 
         if not eval_path:
             self.eval_path = os.path.join(
@@ -146,7 +261,8 @@ class Gener:
 
     @staticmethod
     def _gen_case(
-        ai: str,
+        backend: str,
+        model: str,
         ppt: str,
         case: Dict[str, str],
         ai_kwargs: Dict[str, Any],
@@ -163,7 +279,10 @@ class Gener:
             )
             return
 
-        aiapi = AIAPI(ai, **ai_kwargs)
+        if backend == 'local_hf':
+            aiapi = LocalHFAIAPI(model, **ai_kwargs)
+        else:
+            aiapi = AIAPI(model, **ai_kwargs)
         prompt = make_prompt(ppt)
         resps = prompt.req_ai(
             aiapi,
@@ -182,6 +301,7 @@ class Gener:
     def gen(self) -> None:
         p_map(
             self._gen_case,
+            [self.backend] * len(self.cases),
             [self.model] * len(self.cases),
             [self.ppt] * len(self.cases),
             self.cases.values(),
