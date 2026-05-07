@@ -13,14 +13,14 @@ export DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock
 
 export PYTHONPATH=.
 
-CODEDLLM_ROOT="/research/jiamin0630/codediffu/CodeDllm"
+CODEDLLM_ROOT="xxxx/codediffu/CodeDllm"
 
 # eval_path suffix ``dream_mtast_cweval`` distinguishes outputs from ``dream_ast`` (-ast-inference) runs.
 # Comment out any ``generate_stage1_dream`` / ``evaluate_stage2`` blocks you are not running.
 
 python cweval/generate_stage1_dream.py gen \
   --backend dream_multitask_ast \
-  --model_path "/research/jiamin0630/codediffu/CodeDllm/projects/rl_dream_py_seceval/rl-seceval-frommultitask1300-margin/ckpt/round_14" \
+  --model_path "xxxx/codediffu/CodeDllm/projects/rl_dream_py_seceval/rl-seceval-frommultitask1300-margin/ckpt/round_14" \
   --codedllm_root "${CODEDLLM_ROOT}" \
   --eval_path evals/eval_multitask_ast_bigvul_cm_RLmarginckpt14_n4_4gpu-dream_mtast \
   --ppt direct \

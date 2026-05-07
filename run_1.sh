@@ -13,8 +13,8 @@ export DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock
 
 export PYTHONPATH=.
 
-MTAST_BASE="/research/jiamin0630/codediffu/CodeDllm/projects/sft_dream_py_ast/multitask_stage2_bigvul_cm_1_1024_astdepth_dreambase_2e-6lr"
-CODEDLLM_ROOT="/research/jiamin0630/codediffu/CodeDllm"
+MTAST_BASE="xxxx/codediffu/CodeDllm/projects/sft_dream_py_ast/multitask_stage2_bigvul_cm_1_1024_astdepth_dreambase_2e-6lr"
+CODEDLLM_ROOT="xxxx/codediffu/CodeDllm"
 
 # eval_path suffix ``dream_mtast_cweval`` distinguishes outputs from ``dream_ast`` (-ast-inference) runs.
 # Comment out any ``generate_stage1_dream`` / ``evaluate_stage2`` blocks you are not running.
